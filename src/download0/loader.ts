@@ -106,7 +106,7 @@ const compare_version = (a: string, b: string) => {
 if (!is_jailbroken) {
   const jb_behavior = (typeof CONFIG !== 'undefined' && typeof CONFIG.jb_behavior === 'number') ? CONFIG.jb_behavior : 0
 
-  utils.notify(FW_VERSION + ' Detected!')
+  utils.notify(FW_VERSION + ' Detected! [CIAMIK SORO]')
 
   let use_lapse = false
 
@@ -129,8 +129,9 @@ if (!is_jailbroken) {
 
   // Only wait for lapse - netctrl handles its own completion
   if (use_lapse) {
+    let lapse_completed = false
     const start_time = Date.now()
-    const max_wait_seconds = 5
+    const max_wait_seconds = 10
     const max_wait_ms = max_wait_seconds * 1000
 
     while (!is_exploit_complete()) {
@@ -138,7 +139,7 @@ if (!is_jailbroken) {
 
       if (elapsed > max_wait_ms) {
         log('ERROR: Timeout waiting for exploit to complete (' + max_wait_seconds + ' seconds)')
-        throw new Error('Lapse failed! restart and try again...')
+        break
       }
 
       // Poll every 500ms
@@ -147,23 +148,30 @@ if (!is_jailbroken) {
         // Busy wait
       }
     }
-    const total_wait = ((Date.now() - start_time) / 1000).toFixed(1)
-    log('Exploit completed successfully after ' + total_wait + ' seconds')
-  }
-  if (use_lapse) {
-    log('Initializing binloader...')
 
-    try {
-      binloader_init()
-      log('Binloader initialized and running!')
-    } catch (e) {
-      log('ERROR: Failed to initialize binloader')
-      log('Error message: ' + (e as Error).message)
-      log('Error name: ' + (e as Error).name)
-      if ((e as Error).stack) {
-        log('Stack trace: ' + (e as Error).stack)
+    if (is_exploit_complete()) {
+      lapse_completed = true
+      const total_wait = ((Date.now() - start_time) / 1000).toFixed(1)
+      log('Exploit completed successfully after ' + total_wait + ' seconds')
+    } else {
+      log('Exploit did not complete — skipping payload')
+    }
+
+    if (lapse_completed) {
+      log('Initializing binloader...')
+
+      try {
+        binloader_init()
+        log('Binloader initialized and running!')
+      } catch (e) {
+        log('ERROR: Failed to initialize binloader')
+        log('Error message: ' + (e as Error).message)
+        log('Error name: ' + (e as Error).name)
+        if ((e as Error).stack) {
+          log('Stack trace: ' + (e as Error).stack)
+        }
+        throw e
       }
-      throw e
     }
   }
 } else {

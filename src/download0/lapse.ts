@@ -67,6 +67,12 @@ let sd_pair: [BigInt, BigInt] | null = null
 let saved_fpu_ctrl = 0
 let saved_mxcsr = 0
 
+// Track exploit progress for stage-aware cleanup on failure.
+// 0 = init/setup, 1 = race started, 2+ = kernel objects potentially corrupted.
+// When exploit_stage >= 1 and failure occurs, we must block app exit to
+// prevent kernel panic from double-freeing aliased kernel objects.
+let exploit_stage = 0
+
 // Socket constants - only define if not already in scope
 // (inject.js defines some of these as const in the eval scope)
 const AF_UNIX = 1
@@ -1835,6 +1841,7 @@ function make_kernel_arw (pktopts_sds: BigInt[], reqs1_addr: BigInt, kernel_addr
 export function lapse () {
   try {
     log('=== PS4 Lapse Jailbreak ===')
+    log('[PATCHED] vue-after-free ciamik-soro build')
 
     FW_VERSION = get_fwversion()
     log('Detected PS4 firmware: ' + FW_VERSION)
@@ -1871,10 +1878,12 @@ export function lapse () {
     if (!setup_success) {
       log('Setup failed')
       send_notification('Lapse: Setup failed')
+      cleanup()
       return false
     }
     log('Setup completed')
 
+    exploit_stage = 1
     log('')
     log('=== STAGE 1: Double-free AIO ===')
 
@@ -1883,6 +1892,7 @@ export function lapse () {
     if (sd_pair === null) {
       log('[FAILED] Stage 1')
       send_notification('Lapse: FAILED at Stage 1')
+      cleanup()
       return false
     }
     log('Stage 1 completed')
@@ -1890,9 +1900,11 @@ export function lapse () {
     if (sds === null) {
       log('Failed to create socket list')
       send_notification('Lapse: FAILED at Stage 1 (sds creation)')
+      cleanup()
       return false
     }
 
+    exploit_stage = 2
     log('')
     log('=== STAGE 2: Leak kernel addresses ===')
     const leak_result = leak_kernel_addrs(sd_pair, sds)
@@ -1911,6 +1923,7 @@ export function lapse () {
     log('  aio_info_addr: ' + hex(leak_result.aio_info_addr))
     log('  evf: ' + hex(leak_result.evf))
 
+    exploit_stage = 3
     log('')
     log('=== STAGE 3: Double free SceKernelAioRWRequest ===')
     const pktopts_sds = double_free_reqs1(
@@ -1934,6 +1947,7 @@ export function lapse () {
     log('Stage 3 completed!')
     log('Aliased socket pair: ' + hex(pktopts_sds[0]) + ', ' + hex(pktopts_sds[1]))
 
+    exploit_stage = 4
     log('')
     log('=== STAGE 4: Get arbitrary kernel read/write ===')
 
@@ -2058,8 +2072,10 @@ export function lapse () {
       log('[WARNING] Kernel patches failed - continuing without patches')
     }
 
+    exploit_stage = 5
     log('Stage 5 completed - JAILBROKEN')
     // utils.notify("The Vue-after-Free team congratulates you\nLapse Finished OK\nEnjoy freedom");
+    utils.notify('CIAMIK SORO patched build - JB OK!')
 
     cleanup()
 
@@ -2146,24 +2162,78 @@ function cleanup () {
 }
 
 function cleanup_fail () {
-  utils.notify('Lapse Failed! reboot and try again! UwU')
-
   // Safely push to the UI array if it exists
   if (typeof jsmaf !== 'undefined' && typeof bg_fail !== 'undefined') {
     jsmaf.root.children.push(bg_fail)
   }
 
-  log('Performing minimal cleanup on failure...')
+  log('cleanup_fail: exploit_stage=' + exploit_stage + ', sd_pair=' + (sd_pair !== null))
+
   try {
-    // Thanks to Al-Azif for this minimal cleanup on failure.
+    // === Always safe to cleanup ===
+    // Thanks to Al-Azif for the original minimal cleanup on failure.
     // Thanks to RandQalan for pointing it out.
     // Thanks to ArabPixel for reference: https://github.com/ArabPixel/PSFree-Enhanced/commit/79ba48f68586edf30d911ed9ed39693cfcd109ed.
     // Thanks to m2k7m for implementing it into vue-after-free.
+
+    // Close pipe ends (always safe — not involved in exploit aliasing)
+    if (block_fd !== 0xffffffff) {
+      close(new BigInt(block_fd))
+      block_fd = 0xffffffff
+    }
+
     if (unblock_fd !== 0xffffffff) {
       close(new BigInt(unblock_fd))
       unblock_fd = 0xffffffff
     }
 
+    // Free groom AIO requests (non-exploit housekeeping, always safe)
+    if (groom_ids !== null) {
+      try {
+        const groom_ids_addr = malloc(4 * NUM_GROOMS)
+        for (let i = 0; i < NUM_GROOMS; i++) {
+          write32(groom_ids_addr.add(i * 4), groom_ids[i]!)
+        }
+        free_aios2(groom_ids_addr, NUM_GROOMS)
+      } catch (e) { log('groom cleanup error: ' + (e as Error).message) }
+      groom_ids = null
+    }
+
+    // Wait for + delete blocked AIO workers (safe after closing pipe ends)
+    if (block_id !== 0xffffffff) {
+      try {
+        const block_id_buf = malloc(4)
+        write32(block_id_buf, block_id)
+        const block_errors = malloc(4)
+        aio_multi_wait_fun(block_id_buf, 1, block_errors, 1, 0)
+        aio_multi_delete_fun(block_id_buf, 1, block_errors)
+      } catch (e) { log('block_id cleanup error: ' + (e as Error).message) }
+      block_id = 0xffffffff
+    }
+
+    // === Conditionally safe socket cleanup ===
+    if (sd_pair === null) {
+      // No aliased kernel objects were created.
+      // All sockets have their own independent pktopts — safe to close.
+      if (sds !== null) {
+        for (const sd of sds) {
+          try { close(sd) } catch (e) { /* skip */ }
+        }
+        sds = null
+      }
+      if (sds_alt !== null) {
+        for (const sd of sds_alt) {
+          try { close(sd) } catch (e) { /* skip */ }
+        }
+        sds_alt = null
+      }
+    }
+    // If sd_pair exists: sockets may have aliased/dangling kernel pointers.
+    // We intentionally leak them — the kernel will handle cleanup on process
+    // exit. This is probabilistic but matches observed behavior where closing
+    // the app sometimes works fine even after a failed exploit.
+
+    // Restore scheduling state
     if (prev_core >= 0) {
       log('Restoring to previous core: ' + prev_core)
       pin_to_core(prev_core)
@@ -2171,7 +2241,17 @@ function cleanup_fail () {
     }
 
     set_rtprio(prev_rtprio)
+
   } catch (e) {
-    log('Error during minimal cleanup: ' + (e as Error).message)
+    log('Error during cleanup: ' + (e as Error).message)
+  }
+
+  if (sd_pair !== null) {
+    // Corrupted kernel objects exist. Add a delay to let any in-flight
+    // kernel operations settle before the app potentially closes.
+    utils.notify('Failed! Restart console to try again')
+    nanosleep_fun(2000000000) // 2 second delay for safety
+  } else {
+    utils.notify('Lapse Failed! Restart to try again')
   }
 }

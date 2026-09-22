@@ -124,36 +124,36 @@ jobs:
 
       - name: Upload release assets
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v2.4.2
         with:
           files: |
             vue-after-free-${{ github.ref_name }}.zip
             vue-after-free-lite-${{ github.ref_name }}.zip
 
-  deploy-pages:
-    needs: build
-    runs-on: ubuntu-latest
+  # deploy-pages:
+  #   needs: build
+  #   runs-on: ubuntu-latest
 
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+  #   environment:
+  #     name: github-pages
+  #     url: ${{ steps.deployment.outputs.page_url }}
 
-    steps:
-      - name: Download dist artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
+  #   steps:
+  #     - name: Download dist artifact
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: dist
+  #         path: dist/
 
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: dist/
+  #     - name: Upload Pages artifact
+  #       uses: actions/upload-pages-artifact@v3
+  #       with:
+  #         path: dist/
 
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
-        
+  #     - name: Deploy to GitHub Pages
+  #       id: deployment
+  #       uses: actions/deploy-pages@v4
+
   ufs-image:
     needs: build
     runs-on: ubuntu-latest
@@ -201,11 +201,18 @@ jobs:
       - name: Verify image
         run: file download0.dat
 
+      - name: Compress image
+        run: |
+          sudo apt update
+          sudo apt install -y tar xz-utils zip
+          # tar -cJf download0.dat.tar.xz download0.dat
+          zip -9 download0_dat.zip download0.dat
+
       - name: Upload UFS2 image artifact
         uses: actions/upload-artifact@v4
         with:
-          name: download0.dat
-          path: download0.dat
+          name: download0_dat.zip
+          path: download0_dat.zip
 
       - name: Delete dist artifact
         uses: geekyeggo/delete-artifact@v5
@@ -214,9 +221,9 @@ jobs:
 
       - name: Upload UFS2 release asset
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v2.4.2
         with:
-          files: download0.dat
+          files: download0_dat.zip
 
   ufs-image-lite:
     needs: build
