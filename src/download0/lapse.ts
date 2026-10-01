@@ -2316,7 +2316,6 @@ function cleanup_fail () {
     }
 
     set_rtprio(prev_rtprio)
-
   } catch (e) {
     log('Error during cleanup: ' + (e as Error).message)
   }
